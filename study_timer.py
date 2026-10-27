@@ -160,6 +160,7 @@ class App:
     # ── интерфейс ──
     def build(self):
         t = self.t = THEMES[self.settings.get("theme", "dark")]
+        self.editing_id = None
         for w in self.root.winfo_children():
             w.destroy()
         self.root.configure(bg=t["bg"])
@@ -214,7 +215,11 @@ class App:
             self.chips.append(c)
         self.paint_chips()
 
-        self.btn(wrap, "Добавить пару", self.add, "primary").pack(fill="x")
+        act = tk.Frame(wrap, bg=t["bg"])
+        act.pack(fill="x")
+        self.add_btn = self.btn(act, "Добавить пару", self.add, "primary")
+        self.add_btn.pack(side="left", fill="x", expand=True)
+        self.cancel_btn = self.btn(act, "Отмена", self.cancel_edit)
 
         # список
         tk.Frame(wrap, bg=t["line"], height=1).pack(fill="x", pady=(18, 10))
@@ -265,7 +270,8 @@ class App:
         for it in sorted(self.items, key=lambda x: x["time"]):
             on = it.get("enabled", True)
             r = tk.Frame(self.list_frame, bg=t["card"], highlightthickness=1,
-                         highlightbackground=t["line"])
+                         highlightbackground=t["accent"] if it["id"] == self.editing_id
+                         else t["line"])
             r.pack(fill="x", pady=3)
             dot = tk.Label(r, text="●", cursor="hand2", font=(FONT, 12),
                            bg=t["card"], fg=t["ok"] if on else t["line"])
@@ -284,6 +290,9 @@ class App:
             x.bind("<Button-1>", lambda e, i=it["id"]: self.delete_item(i))
             x.bind("<Enter>", lambda e, w=x: w.configure(fg=t["danger"]))
             x.bind("<Leave>", lambda e, w=x: w.configure(fg=t["muted"]))
+            for w in (r, mid, *mid.winfo_children()):
+                w.configure(cursor="hand2")
+                w.bind("<Button-1>", lambda e, i=it["id"]: self.edit_item(i))
 
     # ── действия ──
     def toggle_theme(self):
@@ -301,14 +310,53 @@ class App:
             return self.status.set("Время в формате ЧЧ:ММ, например 09:30")
         if not link:
             return self.status.set("Нужна корректная ссылка")
-        self.items.append({"id": uuid.uuid4().hex[:8], "subject": subj, "time": tm,
-                           "link": link, "days": sorted(self.sel_days) or list(DEFAULT_DAYS),
-                           "enabled": True})
+        days = sorted(self.sel_days) or list(DEFAULT_DAYS)
+        if self.editing_id:
+            for it in self.items:
+                if it["id"] == self.editing_id:
+                    if (it["time"], it["days"]) != (tm, days):
+                        # время или дни изменились: пара может сработать сегодня заново
+                        self.state["fired"].pop(it["id"], None)
+                        self.save_state()
+                    it.update(subject=subj, time=tm, link=link, days=days)
+            msg = f"Сохранено: {subj}"
+        else:
+            self.items.append({"id": uuid.uuid4().hex[:8], "subject": subj, "time": tm,
+                               "link": link, "days": days, "enabled": True})
+            msg = f"Добавлено: {subj}"
         self.save()
+        self.reset_form()
+        self.status.set(msg)
+
+    def reset_form(self):
+        self.editing_id = None
         for e in (self.e_subj, self.e_time, self.e_link):
             e.delete(0, "end")
+        self.sel_days = set(DEFAULT_DAYS)
+        self.paint_chips()
+        self.add_btn.configure(text="Добавить пару")
+        self.cancel_btn.pack_forget()
         self.render_list()
-        self.status.set(f"Добавлено: {subj}")
+
+    def cancel_edit(self):
+        self.reset_form()
+        self.status.set("Редактирование отменено")
+
+    def edit_item(self, iid):
+        it = next((i for i in self.items if i["id"] == iid), None)
+        if not it:
+            return
+        self.editing_id = iid
+        for e, v in ((self.e_subj, it["subject"]), (self.e_time, it["time"]),
+                     (self.e_link, it["link"])):
+            e.delete(0, "end")
+            e.insert(0, v)
+        self.sel_days = set(it["days"])
+        self.paint_chips()
+        self.add_btn.configure(text="Сохранить изменения")
+        self.cancel_btn.pack(side="left", padx=(8, 0))
+        self.render_list()
+        self.status.set(f'Редактирую: {it["subject"]}')
 
     def toggle_item(self, iid):
         for it in self.items:
@@ -320,7 +368,10 @@ class App:
     def delete_item(self, iid):
         self.items = [i for i in self.items if i["id"] != iid]
         self.save()
-        self.render_list()
+        if iid == self.editing_id:
+            self.reset_form()
+        else:
+            self.render_list()
 
     # ── таймер и защита от дублей ──
     def launch(self, it, now):
