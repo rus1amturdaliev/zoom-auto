@@ -120,6 +120,10 @@ class App:
         self.status = tk.StringVar(value="Готово")
         self.build()
         self.tick()
+        if not self.settings.get("seen_guide"):
+            self.settings["seen_guide"] = True
+            self.save()
+            self.root.after(500, self.show_guide)
 
     # ── хранение ──
     def save(self):
@@ -143,7 +147,7 @@ class App:
         b.bind("<Leave>", lambda e: b.configure(bg=bg, fg=fg))
         return b
 
-    def entry(self, parent, width=None):
+    def entry(self, parent, width=None, hint=""):
         t = self.t
         e = tk.Entry(parent, relief="flat", bg=t["card"], fg=t["fg"],
                      insertbackground=t["fg"], font=(FONT, 11),
@@ -151,7 +155,35 @@ class App:
                      highlightcolor=t["accent"])
         if width:
             e.configure(width=width)
+        e._hint, e._empty = hint, False
+        e.bind("<FocusIn>", lambda ev: self._focus_in(e))
+        e.bind("<FocusOut>", lambda ev: self._focus_out(e))
+        self.set_entry(e, "")
         return e
+
+    def set_entry(self, e, text):
+        e.delete(0, "end")
+        if text:
+            e.configure(fg=self.t["fg"])
+            e.insert(0, text)
+            e._empty = False
+        else:
+            e.configure(fg=self.t["muted"])
+            e.insert(0, e._hint)
+            e._empty = True
+
+    def get_entry(self, e):
+        return "" if e._empty else e.get()
+
+    def _focus_in(self, e):
+        if e._empty:
+            e.delete(0, "end")
+            e.configure(fg=self.t["fg"])
+            e._empty = False
+
+    def _focus_out(self, e):
+        if not e.get():
+            self.set_entry(e, "")
 
     def caption(self, parent, text):
         return tk.Label(parent, text=text, bg=parent["bg"], fg=self.t["muted"],
@@ -173,6 +205,7 @@ class App:
                  bg=t["bg"], fg=t["fg"]).pack(side="left")
         self.btn(head, "☾" if self.settings.get("theme") == "dark" else "☀",
                  self.toggle_theme).pack(side="right")
+        self.btn(head, "?", self.show_guide).pack(side="right")
 
         # ближайшая пара
         card = tk.Frame(wrap, bg=t["card"], highlightthickness=1, highlightbackground=t["line"])
@@ -188,7 +221,7 @@ class App:
 
         # форма
         self.caption(wrap, "ПРЕДМЕТ").pack(anchor="w")
-        self.e_subj = self.entry(wrap)
+        self.e_subj = self.entry(wrap, hint="Например: Физика")
         self.e_subj.pack(fill="x", ipady=6, pady=(3, 10))
 
         row = tk.Frame(wrap, bg=t["bg"])
@@ -196,12 +229,12 @@ class App:
         c1 = tk.Frame(row, bg=t["bg"])
         c1.pack(side="left")
         self.caption(c1, "ВРЕМЯ").pack(anchor="w")
-        self.e_time = self.entry(c1, width=7)
+        self.e_time = self.entry(c1, width=7, hint="09:30")
         self.e_time.pack(ipady=6, pady=(3, 0))
         c2 = tk.Frame(row, bg=t["bg"])
         c2.pack(side="left", fill="x", expand=True, padx=(10, 0))
         self.caption(c2, "ССЫЛКА (ZOOM, MEET, TEAMS, ЛЮБАЯ)").pack(anchor="w")
-        self.e_link = self.entry(c2)
+        self.e_link = self.entry(c2, hint="Вставь ссылку Zoom, Meet или Teams")
         self.e_link.pack(fill="x", ipady=6, pady=(3, 0))
 
         # дни недели
@@ -219,6 +252,8 @@ class App:
         act.pack(fill="x")
         self.add_btn = self.btn(act, "Добавить пару", self.add, "primary")
         self.add_btn.pack(side="left", fill="x", expand=True)
+        self.test_btn = self.btn(act, "Проверить", self.test_form)
+        self.test_btn.pack(side="left", padx=(8, 0))
         self.cancel_btn = self.btn(act, "Отмена", self.cancel_edit)
 
         # список
@@ -264,7 +299,8 @@ class App:
         for w in self.list_frame.winfo_children():
             w.destroy()
         if not self.items:
-            tk.Label(self.list_frame, text="Пока пусто. Добавь первую пару выше.",
+            tk.Label(self.list_frame, text="Пока пусто. Заполни форму выше: предмет, время,\nссылка, дни. Если непонятно, нажми «?» справа вверху.",
+                     justify="left",
                      bg=t["bg"], fg=t["muted"], font=(FONT, 10)).pack(pady=16)
             return
         for it in sorted(self.items, key=lambda x: x["time"]):
@@ -287,6 +323,12 @@ class App:
             x = tk.Label(r, text="✕", cursor="hand2", font=(FONT, 10),
                          bg=t["card"], fg=t["muted"])
             x.pack(side="right", padx=12)
+            pl = tk.Label(r, text="▶", cursor="hand2", font=(FONT, 10),
+                          bg=t["card"], fg=t["muted"])
+            pl.pack(side="right", padx=(0, 2))
+            pl.bind("<Button-1>", lambda e, i=it["id"]: self.test_item(i))
+            pl.bind("<Enter>", lambda e, w=pl: w.configure(fg=t["accent"]))
+            pl.bind("<Leave>", lambda e, w=pl: w.configure(fg=t["muted"]))
             x.bind("<Button-1>", lambda e, i=it["id"]: self.delete_item(i))
             x.bind("<Enter>", lambda e, w=x: w.configure(fg=t["danger"]))
             x.bind("<Leave>", lambda e, w=x: w.configure(fg=t["muted"]))
@@ -295,15 +337,59 @@ class App:
                 w.bind("<Button-1>", lambda e, i=it["id"]: self.edit_item(i))
 
     # ── действия ──
+    def show_guide(self):
+        t = self.t
+        win = tk.Toplevel(self.root)
+        win.title("Как пользоваться")
+        win.configure(bg=t["bg"])
+        win.geometry("430x690")
+        win.resizable(False, False)
+        win.transient(self.root)
+        box = tk.Frame(win, bg=t["bg"])
+        box.pack(fill="both", expand=True, padx=26, pady=22)
+        tk.Label(box, text="Как это работает", font=(FONT, 17, "bold"),
+                 bg=t["bg"], fg=t["fg"]).pack(anchor="w")
+        tk.Label(box, text="Один раз заполни расписание, дальше приложение само откроет "
+                           "ссылку на пару в нужное время. Главное, чтобы оно было запущено.",
+                 wraplength=370, justify="left", font=(FONT, 10), bg=t["bg"],
+                 fg=t["muted"]).pack(anchor="w", pady=(6, 16))
+        steps = [
+            ("1", "Предмет", "Название пары, например «Физика»."),
+            ("2", "Время", "Во сколько начинается пара, например 09:30."),
+            ("3", "Ссылка", "Ссылка на Zoom, Meet или Teams, которую дал преподаватель."),
+            ("4", "Дни", "Нажми на дни недели, когда идёт пара. Подсвеченные дни включены."),
+            ("5", "Добавить пару", "Нажми кнопку. Пара появится в расписании ниже."),
+        ]
+        for n, head, desc in steps:
+            row = tk.Frame(box, bg=t["bg"])
+            row.pack(fill="x", pady=5)
+            tk.Label(row, text=n, width=2, font=(FONT, 10, "bold"), bg=t["accent"],
+                     fg=t["accent_fg"]).pack(side="left", anchor="n", padx=(0, 12))
+            col = tk.Frame(row, bg=t["bg"])
+            col.pack(side="left", fill="x", expand=True)
+            tk.Label(col, text=head, font=(FONT, 11, "bold"), bg=t["bg"],
+                     fg=t["fg"], anchor="w").pack(fill="x")
+            tk.Label(col, text=desc, font=(FONT, 10), bg=t["bg"], fg=t["muted"],
+                     anchor="w", justify="left", wraplength=320).pack(fill="x")
+        tk.Frame(box, bg=t["line"], height=1).pack(fill="x", pady=14)
+        tips = ["Нажми на пару в списке, чтобы изменить время, дни или ссылку.",
+                "Зелёная точка слева включает и выключает пару, ✕ удаляет её.",
+                "Кнопка ▶ у пары открывает её ссылку сразу. Так можно проверить, что всё работает.",
+                "Кнопки внизу: импорт и экспорт расписания, обновление приложения."]
+        for tip in tips:
+            tk.Label(box, text="•  " + tip, font=(FONT, 10), bg=t["bg"], fg=t["muted"],
+                     anchor="w", justify="left", wraplength=370).pack(fill="x", pady=2)
+        self.btn(box, "Понятно", win.destroy, "primary").pack(fill="x", side="bottom")
+
     def toggle_theme(self):
         self.settings["theme"] = "light" if self.settings.get("theme") == "dark" else "dark"
         self.save()
         self.build()
 
     def add(self):
-        subj = self.e_subj.get().strip()
-        tm = parse_time(self.e_time.get())
-        link = normalize_url(self.e_link.get())
+        subj = self.get_entry(self.e_subj).strip()
+        tm = parse_time(self.get_entry(self.e_time))
+        link = normalize_url(self.get_entry(self.e_link))
         if not subj:
             return self.status.set("Укажи предмет")
         if not tm:
@@ -331,12 +417,25 @@ class App:
     def reset_form(self):
         self.editing_id = None
         for e in (self.e_subj, self.e_time, self.e_link):
-            e.delete(0, "end")
+            self.set_entry(e, "")
         self.sel_days = set(DEFAULT_DAYS)
         self.paint_chips()
         self.add_btn.configure(text="Добавить пару")
         self.cancel_btn.pack_forget()
         self.render_list()
+
+    def test_item(self, iid):
+        it = next((i for i in self.items if i["id"] == iid), None)
+        if it:
+            webbrowser.open(it["link"])
+            self.status.set(f'Тест: открыл «{it["subject"]}». Если ссылка открылась, всё настроено верно')
+
+    def test_form(self):
+        link = normalize_url(self.get_entry(self.e_link))
+        if not link:
+            return self.status.set("Сначала вставь ссылку в поле")
+        webbrowser.open(link)
+        self.status.set("Тест: открыл ссылку в браузере. Если зашло, ссылка рабочая")
 
     def cancel_edit(self):
         self.reset_form()
@@ -349,8 +448,7 @@ class App:
         self.editing_id = iid
         for e, v in ((self.e_subj, it["subject"]), (self.e_time, it["time"]),
                      (self.e_link, it["link"])):
-            e.delete(0, "end")
-            e.insert(0, v)
+            self.set_entry(e, v)
         self.sel_days = set(it["days"])
         self.paint_chips()
         self.add_btn.configure(text="Сохранить изменения")
