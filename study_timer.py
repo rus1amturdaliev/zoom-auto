@@ -1,311 +1,479 @@
 #!/usr/bin/env python3
-"""Zoom Auto: в нужное время сам открывает Zoom-ссылку пары."""
-import datetime
+"""Study Timer — само открывает ссылки на пары по расписанию.
+
+Фичи: защита от дублей, любые ссылки (Zoom/Meet/Teams/...), импорт/экспорт
+JSON и CSV, тёмная/светлая тема, обновление из GitHub одной кнопкой.
+Зависимости: только python3 и python3-tk (sudo apt install python3-tk).
+"""
+import csv
 import json
 import os
-import shutil
+import re
 import subprocess
 import sys
+import threading
+import uuid
+import webbrowser
 import tkinter as tk
-from tkinter import messagebox
+from datetime import datetime, timedelta
+from tkinter import filedialog, messagebox
+from urllib.parse import urlparse
 
-CONFIG_DIR = os.path.expanduser("~/.config/study-timer")
-CONFIG = os.path.join(CONFIG_DIR, "classes.json")
-BACKUP = CONFIG + ".bak"          # автоматическая копия перед каждым сохранением
-LINKS_TXT = os.path.join(CONFIG_DIR, "links.txt")  # все пары и ссылки обычным текстом
-GRACE_MIN = 30  # если ноутбук включили позже начала, но не позже 30 мин, всё равно зайдёт
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(os.path.expanduser("~"), ".config", "study-timer")
+DATA_FILE = os.path.join(DATA_DIR, "schedule.json")
+STATE_FILE = os.path.join(DATA_DIR, "state.json")
+os.makedirs(DATA_DIR, exist_ok=True)
 
-BG, CARD, FG, DIM, ACC, RED = "#0f0f10", "#1a1a1c", "#f2f2f2", "#7d7d85", "#4f8cff", "#e5575b"
-FONT = ("Ubuntu", 11)
-FONT_BIG = ("Ubuntu", 20, "bold")
+FONT = "Ubuntu"
 DAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
-DAYS_FULL = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
 DEFAULT_DAYS = [0, 1, 2, 3, 4]
+DEDUPE_MINUTES = 180      # одну и ту же ссылку не открываем чаще, чем раз в 3 часа
+LATE_WINDOW_SEC = 300     # если приложение запустили с опозданием до 5 минут — всё равно откроем
+
+THEMES = {
+    "dark": dict(bg="#0e0f12", card="#16181d", line="#262a32", fg="#e8e9ec",
+                 muted="#7c818c", accent="#7c9cff", accent_fg="#0e0f12",
+                 ok="#5ad19a", danger="#ff6b6b", hover="#1d2027"),
+    "light": dict(bg="#f5f6f8", card="#ffffff", line="#e3e5ea", fg="#14161a",
+                  muted="#7a808c", accent="#3b5bdb", accent_fg="#ffffff",
+                  ok="#1f9d6b", danger="#e03131", hover="#eceef2"),
+}
 
 
-def days_text(days):
-    days = sorted(days)
-    if days == DEFAULT_DAYS:
-        return "Пн-Пт"
-    if len(days) == 7:
-        return "Каждый день"
-    return " ".join(DAYS[i] for i in days)
-
-
-def _read(path):
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
-    if not isinstance(data, list):
-        raise ValueError("bad format")
-    return data
-
-
-def load():
-    """Читает пары. Если файл повреждён, берёт копию и не теряет ссылки."""
-    if not os.path.exists(CONFIG):
-        try:
-            return _read(BACKUP)
-        except (OSError, ValueError):
-            return []
+# ───────────── утилиты ─────────────
+def load_json(path, default):
     try:
-        return _read(CONFIG)
-    except (OSError, ValueError):
-        try:
-            shutil.copy(CONFIG, CONFIG + ".corrupt")
-        except OSError:
-            pass
-        try:
-            return _read(BACKUP)
-        except (OSError, ValueError):
-            return []
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
 
 
-def save(classes):
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    try:  # копия предыдущей версии, только если она целая
-        _read(CONFIG)
-        shutil.copy(CONFIG, BACKUP)
-    except (OSError, ValueError):
-        pass
-    tmp = CONFIG + ".tmp"
+def save_json(path, data):
+    tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(classes, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, CONFIG)
-    try:  # текстовый список для себя
-        with open(LINKS_TXT, "w", encoding="utf-8") as f:
-            for c in sorted(classes, key=lambda x: x["time"]):
-                f.write(f"{c['time']}  {c['name']}  ({days_text(c.get('days', DEFAULT_DAYS))})\n{c['link']}\n\n")
-    except OSError:
-        pass
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
 
 
-def open_link(link):
-    if not link.startswith(("http://", "https://", "zoommtg://")):
-        link = "https://" + link
-    subprocess.Popen(["xdg-open", link], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def normalize_url(u):
+    u = (u or "").strip()
+    if not u:
+        return ""
+    if not re.match(r"^https?://", u, re.I):
+        u = "https://" + u
+    p = urlparse(u)
+    return u if p.netloc and "." in p.netloc else ""
 
 
-def short(text, n=44):
-    return text if len(text) <= n else text[: n - 1] + "…"
+def service_of(url):
+    host = (urlparse(url).hostname or "").lower()
+    if "zoom." in host:
+        return "Zoom"
+    if "meet.google" in host:
+        return "Meet"
+    if "teams." in host or "microsoft" in host:
+        return "Teams"
+    return host.replace("www.", "") or "Link"
 
 
-def same(a, b):
-    return (a["name"], a["time"], a["link"]) == (b["name"], b["time"], b["link"])
+def parse_time(s):
+    m = re.match(r"^\s*(\d{1,2})[:.](\d{2})\s*$", s or "")
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2))
+    return f"{h:02d}:{mi:02d}" if h < 24 and mi < 60 else None
 
 
-class App(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("Zoom Auto")
-        self.configure(bg=BG)
-        self.geometry("480x760")
-        self.minsize(480, 640)
-        self.protocol("WM_DELETE_WINDOW", self.iconify)  # крестик сворачивает, а не закрывает
-
-        self.classes = load()
-        self.shown_day = datetime.date.today()
-        self.day_on = [i in DEFAULT_DAYS for i in range(7)]
-        self.build()
-        self.refresh()
-        self.check()
-        if "--hidden" in sys.argv:
-            self.after(300, self.iconify)
-
-    # ---------- UI ----------
-    def build(self):
-        self.status = tk.Label(self, text="", bg=BG, fg=FG, font=FONT_BIG, anchor="w", justify="left")
-        self.status.pack(fill="x", padx=22, pady=(22, 0))
-        self.sub = tk.Label(self, text="", bg=BG, fg=DIM, font=FONT, anchor="w")
-        self.sub.pack(fill="x", padx=22, pady=(2, 8))
-
-        # форма снизу (создаём раньше списка, чтобы её всегда было видно)
-        form = tk.Frame(self, bg=BG)
-        form.pack(side="bottom", fill="x", padx=22, pady=(8, 22))
-        self.name_e = self.entry(form, "Предмет")
-        self.time_e = self.entry(form, "Время  ЧЧ:ММ")
-        self.link_e = self.entry(form, "Zoom ссылка")
-
-        days_row = tk.Frame(form, bg=BG)
-        days_row.pack(fill="x", pady=(8, 2))
-        self.day_btns = []
+def parse_days(s):
+    out = []
+    for tok in re.split(r"[\s,;]+", s or ""):
         for i, d in enumerate(DAYS):
-            b = tk.Label(days_row, text=d, font=("Ubuntu", 10, "bold"), cursor="hand2", pady=7)
-            b.pack(side="left", expand=True, fill="x", padx=2)
-            b.bind("<Button-1>", lambda e, i=i: self.toggle_day(i))
-            self.day_btns.append(b)
-        self.paint_days()
+            if tok.lower() == d.lower():
+                out.append(i)
+    return sorted(set(out)) or list(DEFAULT_DAYS)
 
-        tk.Button(form, text="Добавить", command=self.add, bg=ACC, fg="white", relief="flat",
-                  activebackground=ACC, activeforeground="white", font=FONT, cursor="hand2", pady=6
-                  ).pack(fill="x", pady=(8, 0))
 
-        # прокручиваемый список по дням
-        wrap = tk.Frame(self, bg=BG)
-        wrap.pack(fill="both", expand=True, padx=22)
-        self.canvas = tk.Canvas(wrap, bg=BG, highlightthickness=0, height=200)
-        self.list_frame = tk.Frame(self.canvas, bg=BG)
-        self.win = self.canvas.create_window((0, 0), window=self.list_frame, anchor="nw")
-        self.list_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(self.win, width=e.width))
-        self.canvas.pack(fill="both", expand=True)
-        self.bind_all("<Button-4>", lambda e: self.canvas.yview_scroll(-1, "units"))
-        self.bind_all("<Button-5>", lambda e: self.canvas.yview_scroll(1, "units"))
-        self.bind_all("<MouseWheel>", lambda e: self.canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+def human_delta(sec):
+    sec = int(sec)
+    if sec < 60:
+        return "меньше минуты"
+    if sec < 3600:
+        return f"{sec // 60} мин"
+    if sec < 86400:
+        return f"{sec // 3600} ч {sec % 3600 // 60} мин"
+    return f"{sec // 86400} д {sec % 86400 // 3600} ч"
 
-    def entry(self, parent, placeholder):
-        e = tk.Entry(parent, bg=CARD, fg=DIM, insertbackground=FG, relief="flat", font=FONT,
-                     highlightthickness=1, highlightbackground=CARD, highlightcolor=ACC)
-        e.insert(0, placeholder)
-        e.placeholder = placeholder
-        e.bind("<FocusIn>", self._focus_in)
-        e.bind("<FocusOut>", self._focus_out)
-        e.pack(fill="x", pady=3, ipady=6)
+
+# ───────────── приложение ─────────────
+class App:
+    def __init__(self, root):
+        self.root = root
+        root.title("Study Timer")
+        root.geometry("470x760")
+        root.minsize(420, 640)
+        self.items = load_json(DATA_FILE, {"items": []}).get("items", [])
+        self.settings = load_json(DATA_FILE, {}).get("settings", {"theme": "dark"})
+        self.state = load_json(STATE_FILE, {"opened": {}, "fired": {}})
+        self.sel_days = set(DEFAULT_DAYS)
+        self.status = tk.StringVar(value="Готово")
+        self.build()
+        self.tick()
+
+    # ── хранение ──
+    def save(self):
+        save_json(DATA_FILE, {"settings": self.settings, "items": self.items})
+
+    def save_state(self):
+        save_json(STATE_FILE, self.state)
+
+    # ── мелкие виджеты ──
+    def btn(self, parent, text, cmd, kind="ghost", **kw):
+        t = self.t
+        if kind == "primary":
+            bg, fg, hov = t["accent"], t["accent_fg"], t["accent"]
+        else:
+            bg, fg, hov = parent["bg"], t["muted"], t["hover"]
+        b = tk.Label(parent, text=text, bg=bg, fg=fg, cursor="hand2",
+                     font=(FONT, 10, "bold" if kind == "primary" else "normal"),
+                     padx=12, pady=7 if kind == "primary" else 4, **kw)
+        b.bind("<Button-1>", lambda e: cmd())
+        b.bind("<Enter>", lambda e: b.configure(bg=hov, fg=t["fg"] if kind != "primary" else fg))
+        b.bind("<Leave>", lambda e: b.configure(bg=bg, fg=fg))
+        return b
+
+    def entry(self, parent, width=None):
+        t = self.t
+        e = tk.Entry(parent, relief="flat", bg=t["card"], fg=t["fg"],
+                     insertbackground=t["fg"], font=(FONT, 11),
+                     highlightthickness=1, highlightbackground=t["line"],
+                     highlightcolor=t["accent"])
+        if width:
+            e.configure(width=width)
         return e
 
-    @staticmethod
-    def _focus_in(ev):
-        e = ev.widget
-        if e.get() == e.placeholder and e.cget("fg") == DIM:
-            e.delete(0, "end")
-            e.config(fg=FG)
+    def caption(self, parent, text):
+        return tk.Label(parent, text=text, bg=parent["bg"], fg=self.t["muted"],
+                        font=(FONT, 8, "bold"))
 
-    @staticmethod
-    def _focus_out(ev):
-        e = ev.widget
-        if not e.get():
-            e.insert(0, e.placeholder)
-            e.config(fg=DIM)
+    # ── интерфейс ──
+    def build(self):
+        t = self.t = THEMES[self.settings.get("theme", "dark")]
+        for w in self.root.winfo_children():
+            w.destroy()
+        self.root.configure(bg=t["bg"])
+        wrap = tk.Frame(self.root, bg=t["bg"])
+        wrap.pack(fill="both", expand=True, padx=22, pady=18)
 
-    def value(self, e):
-        return "" if e.cget("fg") == DIM else e.get().strip()
+        head = tk.Frame(wrap, bg=t["bg"])
+        head.pack(fill="x")
+        tk.Label(head, text="Study Timer", font=(FONT, 18, "bold"),
+                 bg=t["bg"], fg=t["fg"]).pack(side="left")
+        self.btn(head, "☾" if self.settings.get("theme") == "dark" else "☀",
+                 self.toggle_theme).pack(side="right")
 
-    def clear(self, e):
-        e.delete(0, "end")
-        e.insert(0, e.placeholder)
-        e.config(fg=DIM)
+        # ближайшая пара
+        card = tk.Frame(wrap, bg=t["card"], highlightthickness=1, highlightbackground=t["line"])
+        card.pack(fill="x", pady=(14, 14))
+        tk.Label(card, text="БЛИЖАЙШАЯ ПАРА", font=(FONT, 8, "bold"),
+                 bg=t["card"], fg=t["muted"]).pack(anchor="w", padx=16, pady=(12, 0))
+        self.next_title = tk.Label(card, text="—", font=(FONT, 15, "bold"),
+                                   bg=t["card"], fg=t["fg"], anchor="w")
+        self.next_title.pack(fill="x", padx=16)
+        self.next_sub = tk.Label(card, text="", font=(FONT, 10),
+                                 bg=t["card"], fg=t["accent"], anchor="w")
+        self.next_sub.pack(fill="x", padx=16, pady=(0, 12))
+
+        # форма
+        self.caption(wrap, "ПРЕДМЕТ").pack(anchor="w")
+        self.e_subj = self.entry(wrap)
+        self.e_subj.pack(fill="x", ipady=6, pady=(3, 10))
+
+        row = tk.Frame(wrap, bg=t["bg"])
+        row.pack(fill="x")
+        c1 = tk.Frame(row, bg=t["bg"])
+        c1.pack(side="left")
+        self.caption(c1, "ВРЕМЯ").pack(anchor="w")
+        self.e_time = self.entry(c1, width=7)
+        self.e_time.pack(ipady=6, pady=(3, 0))
+        c2 = tk.Frame(row, bg=t["bg"])
+        c2.pack(side="left", fill="x", expand=True, padx=(10, 0))
+        self.caption(c2, "ССЫЛКА (ZOOM, MEET, TEAMS, ЛЮБАЯ)").pack(anchor="w")
+        self.e_link = self.entry(c2)
+        self.e_link.pack(fill="x", ipady=6, pady=(3, 0))
+
+        # дни недели
+        dr = tk.Frame(wrap, bg=t["bg"])
+        dr.pack(fill="x", pady=(12, 12))
+        self.chips = []
+        for i, d in enumerate(DAYS):
+            c = tk.Label(dr, text=d, font=(FONT, 9, "bold"), cursor="hand2", width=4, pady=5)
+            c.pack(side="left", expand=True, padx=2)
+            c.bind("<Button-1>", lambda e, i=i: self.toggle_day(i))
+            self.chips.append(c)
+        self.paint_chips()
+
+        self.btn(wrap, "Добавить пару", self.add, "primary").pack(fill="x")
+
+        # список
+        tk.Frame(wrap, bg=t["line"], height=1).pack(fill="x", pady=(18, 10))
+        self.caption(wrap, "РАСПИСАНИЕ").pack(anchor="w", pady=(0, 6))
+        box = tk.Frame(wrap, bg=t["bg"])
+        box.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(box, bg=t["bg"], highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.list_frame = tk.Frame(self.canvas, bg=t["bg"])
+        win = self.canvas.create_window((0, 0), window=self.list_frame, anchor="nw")
+        self.list_frame.bind("<Configure>",
+                             lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(win, width=e.width))
+        for ev, d in (("<Button-4>", -1), ("<Button-5>", 1)):
+            self.canvas.bind_all(ev, lambda e, d=d: self.canvas.yview_scroll(d, "units"))
+        self.render_list()
+
+        # низ
+        foot = tk.Frame(wrap, bg=t["bg"])
+        foot.pack(fill="x", pady=(10, 0))
+        self.btn(foot, "Импорт", self.do_import).pack(side="left")
+        self.btn(foot, "Экспорт", self.do_export).pack(side="left")
+        self.btn(foot, "Обновить", self.do_update).pack(side="left")
+        tk.Label(wrap, textvariable=self.status, font=(FONT, 9), bg=t["bg"],
+                 fg=t["muted"], anchor="w").pack(fill="x", pady=(6, 0))
+
+    def paint_chips(self):
+        t = self.t
+        for i, c in enumerate(self.chips):
+            on = i in self.sel_days
+            c.configure(bg=t["accent"] if on else t["card"],
+                        fg=t["accent_fg"] if on else t["muted"],
+                        highlightthickness=1,
+                        highlightbackground=t["accent"] if on else t["line"])
 
     def toggle_day(self, i):
-        self.day_on[i] = not self.day_on[i]
-        self.paint_days()
+        self.sel_days ^= {i}
+        self.paint_chips()
 
-    def paint_days(self):
-        for b, on in zip(self.day_btns, self.day_on):
-            b.config(bg=ACC if on else CARD, fg="white" if on else DIM)
-
-    def refresh(self):
+    def render_list(self):
+        t = self.t
         for w in self.list_frame.winfo_children():
             w.destroy()
-        today = datetime.date.today().weekday()
-        shown = False
-        for d in range(7):
-            items = sorted((c for c in self.classes if d in c.get("days", DEFAULT_DAYS)), key=lambda x: x["time"])
-            if not items:
-                continue
-            shown = True
-            title = DAYS_FULL[d] + ("  ·  сегодня" if d == today else "")
-            tk.Label(self.list_frame, text=title, bg=BG, fg=ACC if d == today else DIM,
-                     font=("Ubuntu", 10, "bold"), anchor="w").pack(fill="x", pady=(12, 3))
-            for c in items:
-                self.row(c, d)
-        if not shown:
-            tk.Label(self.list_frame, text="Пар пока нет", bg=BG, fg=DIM, font=FONT).pack(pady=20)
-        self.update_status()
+        if not self.items:
+            tk.Label(self.list_frame, text="Пока пусто. Добавь первую пару выше.",
+                     bg=t["bg"], fg=t["muted"], font=(FONT, 10)).pack(pady=16)
+            return
+        for it in sorted(self.items, key=lambda x: x["time"]):
+            on = it.get("enabled", True)
+            r = tk.Frame(self.list_frame, bg=t["card"], highlightthickness=1,
+                         highlightbackground=t["line"])
+            r.pack(fill="x", pady=3)
+            dot = tk.Label(r, text="●", cursor="hand2", font=(FONT, 12),
+                           bg=t["card"], fg=t["ok"] if on else t["line"])
+            dot.pack(side="left", padx=(12, 4))
+            dot.bind("<Button-1>", lambda e, i=it["id"]: self.toggle_item(i))
+            mid = tk.Frame(r, bg=t["card"])
+            mid.pack(side="left", fill="x", expand=True, pady=8)
+            tk.Label(mid, text=it["subject"], font=(FONT, 11, "bold"), anchor="w",
+                     bg=t["card"], fg=t["fg"] if on else t["muted"]).pack(fill="x")
+            days = " ".join(DAYS[d] for d in it["days"])
+            tk.Label(mid, text=f'{it["time"]}  ·  {days}  ·  {service_of(it["link"])}',
+                     font=(FONT, 9), anchor="w", bg=t["card"], fg=t["muted"]).pack(fill="x")
+            x = tk.Label(r, text="✕", cursor="hand2", font=(FONT, 10),
+                         bg=t["card"], fg=t["muted"])
+            x.pack(side="right", padx=12)
+            x.bind("<Button-1>", lambda e, i=it["id"]: self.delete_item(i))
+            x.bind("<Enter>", lambda e, w=x: w.configure(fg=t["danger"]))
+            x.bind("<Leave>", lambda e, w=x: w.configure(fg=t["muted"]))
 
-    def row(self, c, d):
-        row = tk.Frame(self.list_frame, bg=CARD)
-        row.pack(fill="x", pady=2)
-        tk.Label(row, text=c["time"], bg=CARD, fg=ACC, font=("Ubuntu", 13, "bold"), width=6).pack(side="left", padx=(8, 0), pady=8)
-        tk.Button(row, text="✕", command=lambda: self.remove(c, d), bg=CARD, fg=DIM, relief="flat",
-                  activebackground=CARD, activeforeground=RED, bd=0, cursor="hand2").pack(side="right", padx=8)
-        tk.Button(row, text="▶", command=lambda: open_link(c["link"]), bg=CARD, fg=DIM, relief="flat",
-                  activebackground=CARD, activeforeground=ACC, bd=0, cursor="hand2").pack(side="right")
-        info = tk.Frame(row, bg=CARD)
-        info.pack(side="left", fill="x", expand=True)
-        tk.Label(info, text=c["name"], bg=CARD, fg=FG, font=FONT, anchor="w").pack(fill="x")
-        tk.Label(info, text=short(c["link"]), bg=CARD, fg=DIM, font=("Ubuntu", 8), anchor="w").pack(fill="x")
+    # ── действия ──
+    def toggle_theme(self):
+        self.settings["theme"] = "light" if self.settings.get("theme") == "dark" else "dark"
+        self.save()
+        self.build()
 
-    def update_status(self):
-        now = datetime.datetime.now()
-        today = [c for c in self.classes if now.weekday() in c.get("days", DEFAULT_DAYS)]
-        upcoming = sorted((c for c in today if c["time"] > now.strftime("%H:%M")), key=lambda x: x["time"])
-        if upcoming:
-            n = upcoming[0]
-            self.status.config(text=f"{n['time']}  {n['name']}")
-            self.sub.config(text="Следующая пара. Зайду сам")
-        elif not self.classes:
-            self.status.config(text="Пока пусто")
-            self.sub.config(text="Добавь первую пару ниже")
-        elif not today:
-            self.status.config(text="Сегодня пар нет")
-            self.sub.config(text="Отдыхай")
-        else:
-            self.status.config(text="На сегодня всё")
-            self.sub.config(text="Пар больше нет")
-
-    # ---------- Действия ----------
     def add(self):
-        name, t, link = self.value(self.name_e), self.value(self.time_e), self.value(self.link_e)
-        if not (name and t and link):
-            messagebox.showinfo("Zoom Auto", "Заполни предмет, время и ссылку")
+        subj = self.e_subj.get().strip()
+        tm = parse_time(self.e_time.get())
+        link = normalize_url(self.e_link.get())
+        if not subj:
+            return self.status.set("Укажи предмет")
+        if not tm:
+            return self.status.set("Время в формате ЧЧ:ММ, например 09:30")
+        if not link:
+            return self.status.set("Нужна корректная ссылка")
+        self.items.append({"id": uuid.uuid4().hex[:8], "subject": subj, "time": tm,
+                           "link": link, "days": sorted(self.sel_days) or list(DEFAULT_DAYS),
+                           "enabled": True})
+        self.save()
+        for e in (self.e_subj, self.e_time, self.e_link):
+            e.delete(0, "end")
+        self.render_list()
+        self.status.set(f"Добавлено: {subj}")
+
+    def toggle_item(self, iid):
+        for it in self.items:
+            if it["id"] == iid:
+                it["enabled"] = not it.get("enabled", True)
+        self.save()
+        self.render_list()
+
+    def delete_item(self, iid):
+        self.items = [i for i in self.items if i["id"] != iid]
+        self.save()
+        self.render_list()
+
+    # ── таймер и защита от дублей ──
+    def launch(self, it, now):
+        url = it["link"]
+        last = self.state["opened"].get(url)
+        if last and now - datetime.fromisoformat(last) < timedelta(minutes=DEDUPE_MINUTES):
+            self.status.set(f'{it["subject"]}: ссылка уже открывалась, пропускаю')
+            return
+        webbrowser.open(url)
+        self.state["opened"][url] = now.isoformat()
+        self.status.set(f'{now:%H:%M} открыл: {it["subject"]}')
+
+    def tick(self):
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        for it in self.items:
+            if not it.get("enabled", True) or now.weekday() not in it["days"]:
+                continue
+            h, m = map(int, it["time"].split(":"))
+            start = now.replace(hour=h, minute=m, second=0, microsecond=0)
+            late = (now - start).total_seconds()
+            if 0 <= late < LATE_WINDOW_SEC and self.state["fired"].get(it["id"]) != today:
+                self.state["fired"][it["id"]] = today
+                self.launch(it, now)
+                self.prune_state(now)
+                self.save_state()
+        self.refresh_next(now)
+        self.root.after(1000, self.tick)
+
+    def prune_state(self, now):
+        self.state["opened"] = {u: ts for u, ts in self.state["opened"].items()
+                                if now - datetime.fromisoformat(ts) < timedelta(days=2)}
+        ids = {i["id"] for i in self.items}
+        self.state["fired"] = {k: v for k, v in self.state["fired"].items() if k in ids}
+
+    def next_lesson(self, now):
+        best = None
+        for it in self.items:
+            if not it.get("enabled", True):
+                continue
+            h, m = map(int, it["time"].split(":"))
+            for add in range(8):
+                d = now + timedelta(days=add)
+                if d.weekday() in it["days"]:
+                    dt = d.replace(hour=h, minute=m, second=0, microsecond=0)
+                    if dt >= now:
+                        if best is None or dt < best[0]:
+                            best = (dt, it)
+                        break
+        return best
+
+    def refresh_next(self, now):
+        nxt = self.next_lesson(now)
+        if nxt:
+            dt, it = nxt
+            self.next_title.configure(text=it["subject"])
+            self.next_sub.configure(text=f'через {human_delta((dt - now).total_seconds())}  ·  '
+                                         f'{DAYS[dt.weekday()]} {it["time"]}')
+        else:
+            self.next_title.configure(text="Пар нет")
+            self.next_sub.configure(text="Добавь расписание")
+
+    # ── импорт / экспорт ──
+    def do_export(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".json", initialfile="schedule",
+            filetypes=[("JSON", "*.json"), ("CSV", "*.csv")])
+        if not path:
             return
         try:
-            t = datetime.datetime.strptime(t, "%H:%M").strftime("%H:%M")
-        except ValueError:
-            messagebox.showerror("Zoom Auto", "Время нужно в формате ЧЧ:ММ, например 09:00")
-            return
-        days = [i for i, on in enumerate(self.day_on) if on]
-        if not days:
-            messagebox.showinfo("Zoom Auto", "Выбери хотя бы один день")
-            return
-        self.classes.append({"name": name, "time": t, "link": link, "days": days, "last": ""})
-        save(self.classes)
-        for e in (self.name_e, self.time_e, self.link_e):
-            self.clear(e)
-        self.focus()
-        self.refresh()
+            if path.lower().endswith(".csv"):
+                with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                    w = csv.writer(f)
+                    w.writerow(["subject", "time", "link", "days"])
+                    for it in self.items:
+                        w.writerow([it["subject"], it["time"], it["link"],
+                                    " ".join(DAYS[d] for d in it["days"])])
+            else:
+                save_json(path, {"items": self.items})
+            self.status.set(f"Экспортировано: {os.path.basename(path)}")
+        except Exception as e:
+            messagebox.showerror("Экспорт", str(e))
 
-    def remove(self, c, d):
-        if not messagebox.askyesno("Zoom Auto", f"Убрать «{c['name']}» из дня: {DAYS_FULL[d]}?"):
+    def do_import(self):
+        path = filedialog.askopenfilename(filetypes=[("JSON / CSV", "*.json *.csv")])
+        if not path:
             return
-        for x in self.classes:
-            if same(x, c):
-                days = [i for i in x.get("days", DEFAULT_DAYS) if i != d]
-                if days:
-                    x["days"] = days
-                else:
-                    self.classes.remove(x)
-                break
-        save(self.classes)
-        self.refresh()
+        try:
+            rows = []
+            if path.lower().endswith(".csv"):
+                with open(path, newline="", encoding="utf-8-sig") as f:
+                    for r in csv.DictReader(f):
+                        rows.append({"subject": r.get("subject"), "time": r.get("time"),
+                                     "link": r.get("link"), "days": parse_days(r.get("days"))})
+            else:
+                data = load_json(path, None)
+                data = data.get("items", []) if isinstance(data, dict) else data
+                for r in data or []:
+                    rows.append({"subject": r.get("subject"), "time": r.get("time"),
+                                 "link": r.get("link"), "days": r.get("days") or DEFAULT_DAYS,
+                                 "enabled": r.get("enabled", True)})
+            have = {(i["subject"], i["time"], i["link"]) for i in self.items}
+            added = skipped = 0
+            for r in rows:
+                subj = (r["subject"] or "").strip()
+                tm, link = parse_time(r["time"]), normalize_url(r["link"])
+                if not (subj and tm and link) or (subj, tm, link) in have:
+                    skipped += 1
+                    continue
+                have.add((subj, tm, link))
+                self.items.append({"id": uuid.uuid4().hex[:8], "subject": subj, "time": tm,
+                                   "link": link, "days": sorted(set(r["days"])),
+                                   "enabled": r.get("enabled", True)})
+                added += 1
+            self.save()
+            self.render_list()
+            self.status.set(f"Импорт: добавлено {added}, пропущено {skipped}")
+        except Exception as e:
+            messagebox.showerror("Импорт", str(e))
 
-    # ---------- Автозаход ----------
-    def check(self):
-        now = datetime.datetime.now()
-        if now.date() != self.shown_day:
-            self.shown_day = now.date()
-            self.refresh()
-        fresh = load()  # свежие данные (защита от двойного запуска)
-        if fresh:
-            self.classes = fresh
-        today = now.date().isoformat()
-        changed = False
-        for c in self.classes:
-            if now.weekday() not in c.get("days", DEFAULT_DAYS):
-                continue
-            h, m = map(int, c["time"].split(":"))
-            start = now.replace(hour=h, minute=m, second=0, microsecond=0)
-            delta = (now - start).total_seconds()
-            if 0 <= delta <= GRACE_MIN * 60 and c.get("last") != today:
-                c["last"] = today
-                changed = True
-                open_link(c["link"])
-                if shutil.which("notify-send"):
-                    subprocess.Popen(["notify-send", "Zoom Auto", f"Захожу на пару: {c['name']}"])
-        if changed:
-            save(self.classes)
-        self.update_status()
-        self.after(5000, self.check)
+    # ── обновление из GitHub ──
+    def do_update(self):
+        self.status.set("Проверяю обновления…")
+        threading.Thread(target=self._update_worker, daemon=True).start()
+
+    def _update_worker(self):
+        def run(*args):
+            return subprocess.run(["git", "-C", APP_DIR, *args], capture_output=True,
+                                  text=True, timeout=60)
+        try:
+            top = run("rev-parse", "--show-toplevel")
+            if top.returncode != 0 or os.path.realpath(top.stdout.strip()) != os.path.realpath(APP_DIR):
+                return self.root.after(0, lambda: messagebox.showwarning(
+                    "Обновление", "Папка приложения не является отдельным git-репозиторием. "
+                                  "Пропускаю, чтобы не затронуть другие проекты."))
+            r = run("pull", "--ff-only")
+            out = (r.stdout + r.stderr).strip()
+            if r.returncode != 0:
+                return self.root.after(0, lambda: (self.status.set("Ошибка обновления"),
+                                                   messagebox.showerror("Обновление", out)))
+            if "up to date" in out.lower() or "уже актуально" in out.lower():
+                return self.root.after(0, lambda: self.status.set("Уже последняя версия"))
+            self.root.after(0, self._ask_restart)
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror("Обновление", str(e)))
+
+    def _ask_restart(self):
+        if messagebox.askyesno("Обновление", "Новая версия загружена. Перезапустить приложение?"):
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        self.status.set("Обновлено, перезапусти приложение")
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    root = tk.Tk()
+    App(root)
+    root.mainloop()
